@@ -388,7 +388,7 @@ pub(super) fn set_run_loop(env: &mut Environment, timer: id, run_loop: id) {
 /// For use by `NSRunLoop`: check if a timer is due to fire and fire it if
 //necessary.
 /// Returns the next firing time in guest-clock coordinates, if any.
-pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> {
+pub(super) fn handle_timer(env: &mut Environment, timer: id) -> (Option<Instant>, bool) {
     let &NSTimerHostObject {
         ns_interval,
         rust_interval,
@@ -402,14 +402,16 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
     } = env.objc.borrow(timer);
 
     if is_running_callback {
-        return None;
+        return (None, false);
     }
 
-    let due_by = due_by?;
+    let Some(due_by) = due_by else {
+        return (None, false);
+    };
     let now = env.guest_clock.now();
 
     if due_by > now {
-        return Some(due_by);
+        return (Some(due_by), false);
     }
 
     let overdue_by = now.duration_since(due_by);
@@ -474,5 +476,5 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
     let final_due_by = env.objc.borrow::<NSTimerHostObject>(timer).due_by;
     release(env, timer);
 
-    final_due_by
+    (final_due_by, true)
 }

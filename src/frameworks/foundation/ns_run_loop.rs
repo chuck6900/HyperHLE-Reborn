@@ -101,6 +101,11 @@ pub(crate) fn register_mode(env: &mut Environment, run_loop: id, object: id, mod
     let mode = ns_string::to_rust_string(env, mode).to_string();
     env.objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .sources
+        .push(object);
+
+    env.objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
         .registrations
         .entry(object)
         .or_default()
@@ -117,6 +122,7 @@ pub(crate) fn unregister_mode(env: &mut Environment, run_loop: id, object: id, m
         }
     }
     state.registrations.remove(&object);
+    state.sources.retain(|source| source != &object);
     true
 }
 
@@ -721,7 +727,8 @@ fn run_loop_body(
         }
 
         for timer in timers_tmp.drain(..) {
-            let next_due = ns_timer::handle_timer(env, timer);
+            let (next_due, fired) = ns_timer::handle_timer(env, timer);
+            handled |= fired;
             // Timer deadlines are virtual; audio/UI deadlines remain real.
             let host_due = next_due.map(|due| env.guest_clock.host_deadline(due));
             limit_sleep_time(&mut sleep_until, host_due);

@@ -13,12 +13,14 @@
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::frameworks::foundation::url_loading;
-use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr};
+use crate::mem::{guest_size_of, ConstVoidPtr, MutPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
 };
 use std::sync::mpsc::TryRecvError;
+use crate::frameworks::core_foundation::cf_run_loop::{CFRunLoopSourceHostObject, CFRunLoopSourceRef};
+use crate::frameworks::foundation::ns_run_loop::{register_mode, unregister_mode, NSRunLoopHostObject, NSRunLoopMode};
 
 fn fake_network_success_enabled() -> bool {
     std::env::var_os("TOUCHHLE_FAKE_NETWORK_SUCCESS").is_some()
@@ -40,6 +42,9 @@ struct NSURLConnectionHostObject {
     started: bool,
     cancelled: bool,
     finished: bool,
+
+    run_loop: id,
+    run_loop_mode: NSRunLoopMode,
 }
 impl HostObject for NSURLConnectionHostObject {}
 
@@ -107,24 +112,25 @@ fn invoke_completion_handler(
     let _: () = invoke.call_from_host(env, (block_arg, response, data, error));
 }
 
-/// Finish the connection exactly once and deliver the result on the guest
-/// thread. The timer which called this method retains the connection through
-/// the callbacks, even if the app releases its own reference from a callback.
-fn finish_connection(
-    env: &mut crate::Environment,
+unsafe impl crate::mem::SafeRead for URLConnectionCallbackData{}
+struct URLConnectionCallbackData
+{
     connection: id,
     response: id,
     data: id,
     error: id,
+    source: id,
+}
+
+fn _touchHLE_url_connection_runCallbacks(
+    env: &mut crate::Environment,
+    info: MutPtr<URLConnectionCallbackData>
 ) {
-    let (delegate, handler) = {
-        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(connection);
-        if host.cancelled || host.finished {
-            return;
-        }
-        host.finished = true;
-        host.receiver = None;
-        (host.delegate, host.completion_handler)
+    let (delegate, handler, connection, run_loop, mode, response, data, error, source) = {
+        let info: URLConnectionCallbackData = env.mem.read(info.cast());
+        let connection = env.objc.borrow_mut::<NSURLConnectionHostObject>(info.connection);
+
+        (connection.delegate, connection.completion_handler, connection.run_loop, connection.run_loop_mode, info.connection, info.response, info.data, info.error, info.source)
     };
 
     if delegate != nil {
@@ -136,13 +142,120 @@ fn finish_connection(
             () = msg![env; delegate connectionDidFinishLoading:connection];
         }
     }
+
     invoke_completion_handler(env, handler, response, data, error);
+
+    release(env, response);
+    release(env, data);
+    release(env, error);
 
     let owned_handler = {
         let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(connection);
         std::mem::replace(&mut host.completion_handler, nil)
     };
     release(env, owned_handler);
+
+    env.mem.free(info.cast());
+
+    unregister_mode(env, run_loop, source, mode);
+}
+
+static mut run_callbacks_fn_static: Option<GuestFunction> = None;
+
+/// Finish the connection exactly once and deliver the result on the guest
+/// thread. The timer which called this method retains the connection through
+/// the callbacks, even if the app releases its own reference from a callback.
+fn finish_connection(
+    env: &mut crate::Environment,
+    connection: id,
+    response: id,
+    data: id,
+    error: id,
+) {
+    let (run_loop, mode) = {
+        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(connection);
+
+        (host.run_loop, host.run_loop_mode)
+    };
+
+    let run_callbacks_fn = unsafe {
+        match run_callbacks_fn_static {
+            Some(f) => f,   // already created, reuse it
+            None => {
+                let f = env.dyld.create_guest_function(
+                    &mut env.mem,
+                    "_touchHLE_url_connection_runCallbacks",
+                    &(_touchHLE_url_connection_runCallbacks
+                        as fn(&mut crate::Environment, MutPtr<URLConnectionCallbackData>) -> ()),
+                );
+                run_callbacks_fn_static = Some(f);
+                f
+            }
+        }
+    };
+
+    if run_loop != nil {
+        let ptr: MutPtr<URLConnectionCallbackData> = env.mem.alloc(guest_size_of::<URLConnectionCallbackData>()).cast();
+
+        let host = Box::new(CFRunLoopSourceHostObject {
+            version: 0,
+            info: ptr.cast(),
+            retain: GuestFunction::null_ptr(),
+            release: GuestFunction::null_ptr(),
+            copy_description: GuestFunction::null_ptr(),
+            equal: GuestFunction::null_ptr(),
+            hash: GuestFunction::null_ptr(),
+            schedule: GuestFunction::null_ptr(),
+            cancel: GuestFunction::null_ptr(),
+            perform: run_callbacks_fn,
+            order: 0,
+            valid: true,
+            signaled: true,
+        });
+        let class = env
+            .objc
+            .get_known_class("_touchHLE_CFRunLoopSource", &mut env.mem);
+        let source = env.objc.alloc_object(class, host, &mut env.mem);
+
+        retain(env, response);
+        retain(env, data);
+        retain(env, error);
+
+        env.mem.write(ptr, URLConnectionCallbackData {
+            connection,
+            response,
+            data,
+            error,
+            source
+        });
+
+        register_mode(env, run_loop, source, mode);
+    }
+    else {
+        let (delegate, handler) = {
+            let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(connection);
+
+            (host.delegate, host.completion_handler)
+        };
+
+        if delegate != nil {
+            if error != nil {
+                () = msg![env; delegate connection:connection didFailWithError:error];
+            } else {
+                () = msg![env; delegate connection:connection didReceiveResponse:response];
+                () = msg![env; delegate connection:connection didReceiveData:data];
+                () = msg![env; delegate connectionDidFinishLoading:connection];
+            }
+        }
+
+        invoke_completion_handler(env, handler, response, data, error);
+
+        let owned_handler = {
+            let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(connection);
+            std::mem::replace(&mut host.completion_handler, nil)
+        };
+        release(env, owned_handler);
+    }
 }
 
 fn schedule_connection_poll(env: &mut crate::Environment, connection: id, delay: f64) {
@@ -292,9 +405,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this initWithRequest:request delegate:delegate startImmediately:true]
 }
 
+- (())scheduleInRunLoop:(id)run_loop
+             forMode:(NSRunLoopMode)mode {
+    if run_loop == nil {
+        log!("NSURLConnection scheduleInRunLoop:forMode: nil runLoop — returning nil");
+        release(env, this);
+        return;
+    }
+    retain(env, run_loop);
+    {
+        let host = env.objc.borrow_mut::<NSURLConnectionHostObject>(this);
+        host.run_loop = run_loop;
+        host.run_loop_mode = mode;
+    }
+}
+
 - (id)initWithRequest:(id)request
-             delegate:(id)delegate
-     startImmediately:(bool)start_immediately {
+         delegate:(id)delegate
+ startImmediately:(bool)start_immediately {
     if request == nil {
         log!("NSURLConnection initWithRequest: nil request — returning nil");
         release(env, this);
